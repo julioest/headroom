@@ -1641,6 +1641,9 @@ struct Tile: View {
                 .monospacedDigit()
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
+                // Shrink only to fit the width. Squeezed vertically it shrank in every
+                // frame and popped back to full size while the window resized.
+                .fixedSize(horizontal: false, vertical: true)
             Text(detail).font(.caption2).foregroundStyle(detailColor).lineLimit(1)
             PartsBar(parts: parts, total: partsTotal)
                 .padding(.top, 5)
@@ -2406,7 +2409,10 @@ struct HeadroomApp: App {
 
     var body: some Scene {
         MenuBarExtra {
+            // The window resizes a frame after the content does; pinned to the top,
+            // the content doesn't jump to the middle of the old size in between.
             ContentView(model: model)
+                .frame(maxHeight: .infinity, alignment: .top)
         } label: {
             MenuLabel(status: model.status)
         }
