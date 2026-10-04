@@ -22,6 +22,8 @@ I use Docker every day for work, usually with a few copies of the same site runn
 - **Breakdown:** click an app to see what its memory is made of: the scripts a Python is running and the folders they run in, a browser's web content next to its extensions, an IDE next to its helpers, each Claude Code session by project. "More…" lists every app instead of the top few, each with the same breakdown.
 - **Containers:** grouped by compose project, if Docker Desktop or OrbStack is running. Hover to stop or start them, click a port to open it in your browser, and stop any container that keeps crashing. When the Docker VM holds a lot more memory than its containers use, or Docker stops responding, Headroom offers to restart Docker, then starts the containers that were running. OrbStack gives memory back on its own, so it gets no such offer.
 
+<img src="screenshots/headroom-demo.gif" width="40%" alt="Clicking Safari to see its breakdown, then More… to list every app">
+
 The menu bar icon is a capsule that fills up as your Mac gets busy. The empty space at the top is your headroom. It turns orange when your Mac is busy and red when it's slow.
 
 <img src="screenshots/headroom-slowing-down.png" width="40%" alt="Headroom naming ffmpeg as the app slowing the Mac down">
