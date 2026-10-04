@@ -425,12 +425,15 @@ final class ProcScanner: @unchecked Sendable {
         // belong to whoever launched them: Safari's tabs, Docker's VM, Chrome's
         // extensions. Only those; a CLI tool is not "part of" the terminal.
         let isService = path.contains(".xpc/") || path.contains(".appex/")
+        // A Linux VM belongs to whatever started it, app or not: Docker, or
+        // limactl for Colima and Lima. It is never part of macOS.
+        let isVM = path.contains("Virtualization.VirtualMachine")
         var host = ""
         var hostLS = ""
         var base = path
         if isService, let r = responsible?(pid), r != pid, let hostPath = exePath(r) {
             let (hostName, hostBundle) = appGroup(hostPath)
-            if hostBundle != nil {
+            if hostBundle != nil || isVM {
                 (name, bundle, host, base) = (hostName, hostBundle, hostName, hostPath)
                 hostLS = NSRunningApplication(processIdentifier: r)?.localizedName ?? ""
             }
@@ -438,7 +441,7 @@ final class ProcScanner: @unchecked Sendable {
 
         // Apple's own user-facing apps (Safari, Mail) are quittable like any other.
         // A hosted helper counts as system or not by its host, so Finder stays system.
-        let system = systemDirs.contains { base.hasPrefix($0) } && !base.contains("/Applications/")
+        let system = systemDirs.contains { base.hasPrefix($0) } && !base.contains("/Applications/") && !isVM
 
         let (label, detail) = describeProcess(pid: pid, path: path, exe: exe, app: name, host: host, hostLS: hostLS)
         return Owner(name: name, bundle: bundle, system: system, label: label, detail: detail)
@@ -605,6 +608,7 @@ enum Docker {
         var bodyStart = 0
         var chunked = false
         var length: Int?
+        var code: Int?
         while true {
             let n = read(fd, &buf, buf.count)
             if n <= 0 { break }
@@ -612,6 +616,7 @@ enum Docker {
             if head == nil, let split = data.range(of: crlf2) {
                 head = String(decoding: data[..<split.lowerBound], as: UTF8.self)
                 bodyStart = split.upperBound
+                code = head!.split(separator: " ").dropFirst().first.flatMap { Int($0) }
                 for line in head!.split(separator: "\r\n") {
                     let l = line.lowercased()
                     if l.hasPrefix("transfer-encoding:") && l.contains("chunked") { chunked = true }
@@ -621,12 +626,13 @@ enum Docker {
                 }
             }
             guard head != nil else { continue }
+            // Stop and start answer 204 or 304: no body, and OrbStack never closes,
+            // so waiting for more would sit out the whole timeout.
+            if let c = code, c == 204 || c == 304 || (100..<200).contains(c) { break }
             if chunked, data.suffix(5) == Data("0\r\n\r\n".utf8) { break }
             if let length, data.count - bodyStart >= length { break }
         }
-        guard let head,
-              let code = head.split(separator: " ").dropFirst().first.flatMap({ Int($0) }),
-              (200..<300).contains(code) else { return nil }
+        guard head != nil, let code, (200..<300).contains(code) else { return nil }
         let body = data[bodyStart...]
         return chunked ? dechunk(body) : body
     }
