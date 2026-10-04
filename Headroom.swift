@@ -10,7 +10,31 @@ import Darwin
 import ServiceManagement
 
 let gb = 1_073_741_824.0
-let dockerSocket = NSHomeDirectory() + "/.docker/run/docker.sock"
+let home = NSHomeDirectory()
+
+// A container engine: a Mac app that runs a Linux VM and speaks the Docker API
+// over a unix socket. Docker Desktop and OrbStack both do.
+struct Engine: Identifiable, Equatable {
+    var id: String { name }
+    let name: String  // also the app group name in the process list
+    let appPath: String
+    let socket: String
+    // Docker's VM keeps memory its containers no longer use until Docker restarts.
+    // OrbStack hands memory back to macOS on its own, so there is nothing to reclaim.
+    let canReclaim: Bool
+    let bundleID: String  // the running app that says the engine is up
+
+    // Where the containers running at the last good scan are remembered.
+    var lastContainersKey: String { self == .docker ? Pref.lastContainers : Pref.lastContainers + "." + name }
+
+    static let docker = Engine(name: "Docker", appPath: "/Applications/Docker.app",
+                               socket: home + "/.docker/run/docker.sock", canReclaim: true,
+                               bundleID: "com.docker.docker")
+    static let orbstack = Engine(name: "OrbStack", appPath: "/Applications/OrbStack.app",
+                                 socket: home + "/.orbstack/run/docker.sock", canReclaim: false,
+                                 bundleID: "dev.kdrag0n.MacVirt")
+    static let known = [docker, orbstack]
+}
 
 // MARK: - Types
 
@@ -57,16 +81,66 @@ enum Verdict: Int, Comparable {
     }
 }
 
+// One process, described well enough to tell apart from its siblings: the
+// script a Python runs, the folder a CLI tool runs in, what a helper does.
+struct ProcUsage: Identifiable {
+    var id: pid_t { pid }
+    let pid: pid_t
+    let label: String  // "serve.py", "headroom", "Web Content", "Helper (Renderer)"
+    let detail: String?  // "~/Documents/Code/AI/workflows", nil for the app's main process
+    let mb: Double
+    let cpu: Double
+}
+
+// Processes of one app that share a label, as one row of the app's breakdown.
+struct AppPart: Identifiable {
+    var id: String { label }
+    let label: String
+    let detail: String?
+    let mb: Double
+    let cpu: Double
+    let count: Int
+}
+
 struct AppUsage: Identifiable {
     var id: String { name }
     let name: String
     let bundlePath: String?  // the .app to take the icon from and to quit
     let mb: Double
     let cpu: Double  // percent of one core, summed over the app's processes
-    let count: Int
     let isSystem: Bool  // part of macOS, nothing to act on
+    let procs: [ProcUsage]
 
-    var isDockerVM: Bool { name == "Docker VM" }
+    var count: Int { procs.count }
+
+    // Same label -> one row, with a count. The detail stays only when every
+    // process in the row agrees on it; otherwise it names the biggest one.
+    var parts: [AppPart] {
+        var order: [String] = []
+        var by: [String: [ProcUsage]] = [:]
+        for p in procs {
+            if by[p.label] == nil { order.append(p.label) }
+            by[p.label, default: []].append(p)
+        }
+        return order.map { label in
+            let ps = by[label]!
+            let details = Set(ps.compactMap(\.detail))
+            let detail: String?
+            if ps.count == 1 || details.count == 1 { detail = details.first }
+            else { detail = "largest " + formatMB(ps.map(\.mb).max() ?? 0) }
+            return AppPart(label: label, detail: detail, mb: ps.reduce(0) { $0 + $1.mb },
+                           cpu: ps.reduce(0) { $0 + $1.cpu }, count: ps.count)
+        }
+    }
+
+    // Worth expanding: more than one row, or one row that says something
+    // beyond the app's own name.
+    var hasBreakdown: Bool {
+        procs.count > 1 || procs.first.map { $0.label != name || $0.detail != nil } ?? false
+    }
+
+    // Memory of the app's virtual machine processes, for container engines.
+    var vmMB: Double { procs.filter { $0.label == ProcScanner.vmLabel }.reduce(0) { $0 + $1.mb } }
 }
 
 // Cheap system numbers, sampled every tick.
@@ -81,7 +155,8 @@ struct Sample {
 }
 
 struct Container: Identifiable {
-    var id: String { name }
+    var id: String { engine + "/" + name }
+    let engine: String  // Engine.name it runs under
     let name: String
     let image: String
     let project: String  // compose project, "" if none
@@ -210,39 +285,74 @@ func sampleDisk() -> (free: Double, total: Double)? {
 // and the link itself gets the alias icon with the shortcut arrow.
 let safariBundle = ("/Applications/Safari.app" as NSString).resolvingSymlinksInPath
 
+// Interpreters get one group each, whatever the binary is called: python3.12,
+// Python (from Python.app inside a framework) and a venv's python are all Python.
+func interpreterName(_ exe: String) -> String? {
+    let e = exe.lowercased()
+    if e.hasPrefix("python") { return "Python" }
+    if e == "node" || e == "bun" || e == "deno" { return "Node.js" }
+    if e == "ruby" { return "Ruby" }
+    if e == "perl" { return "Perl" }
+    if e == "java" { return "Java" }
+    if e.hasPrefix("php") { return "PHP" }
+    return nil
+}
+
 // Group helpers under their app: ".../Google Chrome.app/.../Helper" -> "Google Chrome".
 func appGroup(_ path: String) -> (name: String, bundle: String?) {
-    if path.contains("Virtualization.VirtualMachine") {
-        return ("Docker VM", "/Applications/Docker.app")
-    }
-    if path.contains("com.apple.WebKit") || path.contains("/Safari.app/") {
-        return ("Safari & WebKit", safariBundle)
-    }
     if path.hasSuffix("/claude") || path.contains("/claude/versions/") { return ("Claude Code", nil) }
+    let exe = path.split(separator: "/").last.map(String.init) ?? path
+    // Python.app inside Python.framework is still Python; "java" inside some
+    // IDE's bundle is that IDE.
+    if let name = interpreterName(exe), !path.contains(".app/") || path.contains("/Python.app/") {
+        return (name, nil)
+    }
     // Plain string slicing: URL(fileURLWithPath:) stats the disk to check for a directory.
     if let r = path.range(of: ".app/") {
         let bundle = String(path[..<r.lowerBound])
         let name = bundle.split(separator: "/").last.map(String.init) ?? bundle
+        // Safari lives in a cryptex; the link in /Applications would show an alias icon.
+        if name == "Safari" { return (name, safariBundle) }
         return (name, bundle + ".app")
     }
-    return (path.split(separator: "/").last.map(String.init) ?? path, nil)
+    return (exe, nil)
+}
+
+// What a process is, within its app. Worked out once per pid.
+struct Owner {
+    let name: String  // app group
+    let bundle: String?
+    let system: Bool
+    let label: String
+    let detail: String?
 }
 
 // Keeps the previous CPU times so each scan can turn them into a percentage.
 // Only touched from Model's background queue.
 final class ProcScanner: @unchecked Sendable {
+    static let vmLabel = "Linux VM"
+
     private var lastCPU: [pid_t: UInt64] = [:]  // ns
     private var lastWall: UInt64 = 0  // ns
     // pid -> app it belongs to. Worked out once per process, not every scan.
-    private var owners: [pid_t: (name: String, bundle: String?, system: Bool)] = [:]
+    private var owners: [pid_t: Owner] = [:]
+    // bundle path -> its CFBundleExecutable, to tell the main binary from siblings.
+    private var mainExe: [String: String] = [:]
     private let ticksToNs: Double = {
         var tb = mach_timebase_info()
         mach_timebase_info(&tb)
         return Double(tb.numer) / Double(tb.denom)
     }()
     private let systemDirs = ["/System/", "/usr/", "/sbin/", "/bin/", "/Library/Apple/"]
-    // Apple's own apps (Maps, Mail, Safari) live under /System but quit like any other app.
-    private let appleAppDirs = ["/System/Applications/", "/System/Cryptexes/App/System/Applications/"]
+    private var buf = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+
+    // The process that launched an XPC service or app extension, as Activity
+    // Monitor groups them. Public in libSystem but not declared in any header.
+    private typealias ResponsibleFn = @convention(c) (pid_t) -> pid_t
+    private let responsible: ResponsibleFn? = {
+        dlsym(dlopen(nil, RTLD_NOW), "responsibility_get_pid_responsible_for_pid")
+            .map { unsafeBitCast($0, to: ResponsibleFn.self) }
+    }()
 
     // Processes owned by other users (WindowServer, daemons) can't be read
     // without root; they're macOS internals you couldn't quit anyway.
@@ -256,9 +366,9 @@ final class ProcScanner: @unchecked Sendable {
         let got = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
 
         var cpuNow: [pid_t: UInt64] = [:]
-        var seen: [pid_t: (name: String, bundle: String?, system: Bool)] = [:]
-        var groups: [String: (bundle: String?, mb: Double, cpu: Double, count: Int, system: Bool)] = [:]
-        var buf = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        var seen: [pid_t: Owner] = [:]
+        var order: [String] = []
+        var groups: [String: (bundle: String?, system: Bool, procs: [ProcUsage])] = [:]
 
         for pid in pids.prefix(Int(max(got, 0))) where pid > 0 {
             var ri = rusage_info_v4()
@@ -276,39 +386,192 @@ final class ProcScanner: @unchecked Sendable {
             let mb = Double(ri.ri_phys_footprint) / 1_048_576
             guard mb >= 1 || cpu > 0 else { continue }
 
-            let owner: (name: String, bundle: String?, system: Bool)
-            if let o = owners[pid] {
-                owner = o
-            } else {
-                guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { continue }
-                let path = String(cString: buf)
-                let (name, bundle) = appGroup(path)
-                let system = systemDirs.contains { path.hasPrefix($0) }
-                    && !appleAppDirs.contains { path.hasPrefix($0) }
-                    && name != "Docker VM" && name != "Safari & WebKit"
-                owner = (name, bundle, system)
-            }
+            guard let owner = owners[pid] ?? describe(pid) else { continue }
             seen[pid] = owner
 
-            let g = groups[owner.name] ?? (owner.bundle, 0, 0, 0, true)
-            groups[owner.name] = (g.bundle, g.mb + mb, g.cpu + cpu, g.count + 1, g.system && owner.system)
+            if groups[owner.name] == nil {
+                order.append(owner.name)
+                groups[owner.name] = (owner.bundle, true, [])
+            }
+            groups[owner.name]!.procs.append(ProcUsage(pid: pid, label: owner.label, detail: owner.detail,
+                                                       mb: mb, cpu: cpu))
+            groups[owner.name]!.system = groups[owner.name]!.system && owner.system
+            if groups[owner.name]!.bundle == nil { groups[owner.name]!.bundle = owner.bundle }
         }
         lastCPU = cpuNow
         owners = seen  // drops exited pids, so a reused pid gets looked up again
 
-        return groups.map {
-            AppUsage(name: $0.key, bundlePath: $0.value.bundle, mb: $0.value.mb,
-                     cpu: $0.value.cpu, count: $0.value.count, isSystem: $0.value.system)
+        return order.map { name in
+            let g = groups[name]!
+            // Biggest first, so the breakdown reads top-down like the app list.
+            let procs = g.procs.sorted { $0.mb > $1.mb }
+            return AppUsage(name: name, bundlePath: g.bundle, mb: procs.reduce(0) { $0 + $1.mb },
+                            cpu: procs.reduce(0) { $0 + $1.cpu }, isSystem: g.system, procs: procs)
         }
+    }
+
+    private func exePath(_ pid: pid_t) -> String? {
+        proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 ? String(cString: buf) : nil
+    }
+
+    // MARK: Describing a process
+
+    private func describe(_ pid: pid_t) -> Owner? {
+        guard let path = exePath(pid) else { return nil }
+        let exe = path.split(separator: "/").last.map(String.init) ?? path
+        var (name, bundle) = appGroup(path)
+
+        // XPC services and extensions run from /System or their own bundle, but
+        // belong to whoever launched them: Safari's tabs, Docker's VM, Chrome's
+        // extensions. Only those; a CLI tool is not "part of" the terminal.
+        let isService = path.contains(".xpc/") || path.contains(".appex/")
+        var host = ""
+        var hostLS = ""
+        var base = path
+        if isService, let r = responsible?(pid), r != pid, let hostPath = exePath(r) {
+            let (hostName, hostBundle) = appGroup(hostPath)
+            if hostBundle != nil {
+                (name, bundle, host, base) = (hostName, hostBundle, hostName, hostPath)
+                hostLS = NSRunningApplication(processIdentifier: r)?.localizedName ?? ""
+            }
+        }
+
+        // Apple's own user-facing apps (Safari, Mail) are quittable like any other.
+        // A hosted helper counts as system or not by its host, so Finder stays system.
+        let system = systemDirs.contains { base.hasPrefix($0) } && !base.contains("/Applications/")
+
+        let (label, detail) = describeProcess(pid: pid, path: path, exe: exe, app: name, host: host, hostLS: hostLS)
+        return Owner(name: name, bundle: bundle, system: system, label: label, detail: detail)
+    }
+
+    private func mainExecutable(of bundle: String) -> String {
+        if let e = mainExe[bundle] { return e }
+        let e = Bundle(path: bundle)?.executableURL?.lastPathComponent
+            ?? bundle.split(separator: "/").last.map { String($0.dropLast(4)) } ?? ""
+        mainExe[bundle] = e
+        return e
+    }
+
+    // The label tells siblings apart; the detail says where or what.
+    private func describeProcess(pid: pid_t, path: String, exe: String, app: String, host: String, hostLS: String)
+        -> (String, String?)
+    {
+        let args = arguments(of: pid)
+
+        if path.contains("Virtualization.VirtualMachine") || (app == "OrbStack" && args.dropFirst().first == "vmgr") {
+            return (Self.vmLabel, nil)
+        }
+
+        // Scripts: "python -u serve.py --flag" -> "serve.py" in its folder.
+        // npm and friends overwrite argv with a title ("npm exec foo"); use it.
+        if interpreterName(exe) != nil {
+            let title = args.first.flatMap { $0.contains(" ") ? $0 : nil }
+            return (scriptName(args) ?? title ?? exe, folder(of: pid, fallback: args))
+        }
+
+        // An app's own main executable. Siblings beside it (crash handlers,
+        // plugin hosts) fall through and show by their own name.
+        if let r = path.range(of: ".app/Contents/MacOS/"), !path[r.upperBound...].contains("/"),
+           !path[..<r.lowerBound].contains(".app/"), host.isEmpty,
+           exe == mainExecutable(of: String(path[..<r.lowerBound]) + ".app") {
+            return (app, nil)
+        }
+
+        // Helpers inside the bundle, and services the app launched. Launch
+        // Services knows a better name for some: "Safari Web Content",
+        // "Safari Service Worker (youtube.com)", "Grammarly Web Extension".
+        if path.contains(".app/") || path.contains(".xpc/") || path.contains(".appex/") || !host.isEmpty {
+            var label = exe
+            if path.contains(".xpc/"), let ls = NSRunningApplication(processIdentifier: pid)?.localizedName,
+               !ls.isEmpty {
+                label = ls
+            }
+            if label.hasPrefix("com.apple.") { label = String(label.dropFirst("com.apple.".count)) }
+            for prefix in [app + " ", host + " "] where prefix.count > 1 && label.hasPrefix(prefix) {
+                label = String(label.dropFirst(prefix.count))
+            }
+            // Apple's shared services put the host at the end instead:
+            // "Open and Save Panel Service (CLion)", "AutoFill (iTerm2)".
+            for suffix in [app, host, hostLS].map({ " (\($0))" }) where suffix.count > 3 && label.hasSuffix(suffix) {
+                label = String(label.dropLast(suffix.count))
+            }
+            return (label, nil)
+        }
+
+        // Command-line tools: the folder they run in is what tells them apart.
+        // "claude" in ~/Downloads/headroom is the session on that project.
+        // A sandbox container is no project folder.
+        if let dir = folder(of: pid, fallback: []), dir != "/", dir != "~", !dir.hasPrefix("~/Library/Containers/") {
+            return (dir.split(separator: "/").last.map(String.init) ?? exe, dir)
+        }
+        return (exe, nil)
+    }
+
+    // The first argument that isn't an option: "python -u serve.py" -> "serve.py",
+    // "python -m http.server" -> "http.server". Every project has an index.js
+    // or main.py, so those carry the first folder that says something.
+    private func scriptName(_ args: [String]) -> String? {
+        var rest = args.dropFirst()
+        while let a = rest.first {
+            rest = rest.dropFirst()
+            if a == "-m" || a == "--module" { return rest.first }
+            if a == "-c" || a == "-e" { return nil }
+            if a.hasPrefix("-") || a.isEmpty { continue }
+            let parts = a.split(separator: "/").map(String.init)
+            guard let file = parts.last else { return nil }
+            let generic = ["index.js", "index.mjs", "index.cjs", "main.js", "server.js", "cli.js", "app.js",
+                           "main.py", "__main__.py", "app.py", "run.py", "server.py", "manage.py", "cli.py"]
+            let noise = ["src", "dist", "lib", "bin", "build", "out", "scripts", "node_modules", ".bin"]
+            guard generic.contains(file),
+                  let dir = parts.dropLast().last(where: { !noise.contains($0) }) else { return file }
+            return dir + "/" + file
+        }
+        return nil
+    }
+
+    // Working directory with ~ for home; the script's folder when the process
+    // runs from / (launchd jobs do).
+    private func folder(of pid: pid_t, fallback args: [String]) -> String? {
+        var vi = proc_vnodepathinfo()
+        let n = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &vi, Int32(MemoryLayout<proc_vnodepathinfo>.size))
+        var dir = n > 0 ? withUnsafePointer(to: &vi.pvi_cdir.vip_path) {
+            $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
+        } : ""
+        if dir == "/" || dir.isEmpty, let script = args.dropFirst().first(where: { $0.hasPrefix("/") }) {
+            dir = script.split(separator: "/").dropLast().reduce("") { $0 + "/" + $1 }
+        }
+        guard !dir.isEmpty else { return nil }
+        if dir.hasPrefix(home) { dir = "~" + dir.dropFirst(home.count) }
+        return dir
+    }
+
+    // argv, readable for our own processes. Layout: argc, exec path, NULs, argv...
+    private func arguments(of pid: pid_t) -> [String] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return [] }
+        var raw = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &raw, &size, nil, 0) == 0 else { return [] }
+        let argc = Int(raw.withUnsafeBytes { $0.load(as: Int32.self) })
+        var i = 4
+        while i < size && raw[i] != 0 { i += 1 }  // exec path
+        while i < size && raw[i] == 0 { i += 1 }  // padding
+        var args: [String] = []
+        var cur: [UInt8] = []
+        while i < size && args.count < argc {
+            if raw[i] == 0 { args.append(String(decoding: cur, as: UTF8.self)); cur = [] }
+            else { cur.append(raw[i]) }
+            i += 1
+        }
+        return args
     }
 }
 
-// MARK: - Docker (Engine API over its unix socket, no CLI)
+// MARK: - Docker API (over an engine's unix socket, no CLI)
 
 enum Docker {
-    // Minimal HTTP/1.0 over the socket: the server closes the connection after
-    // one response, so there is no chunking or keep-alive to deal with.
-    static func request(_ method: String, _ path: String, timeout: Int = 3) -> Data? {
+    // Minimal HTTP/1.1 + Connection: close over the socket; stops at Content-Length or the final chunk and dechunks.
+    static func request(_ engine: Engine, _ method: String, _ path: String, timeout: Int = 3) -> Data? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
@@ -320,7 +583,7 @@ enum Docker {
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = Array(dockerSocket.utf8.prefix(MemoryLayout.size(ofValue: addr.sun_path) - 1))
+        let pathBytes = Array(engine.socket.utf8.prefix(MemoryLayout.size(ofValue: addr.sun_path) - 1))
         withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: pathBytes) }
         let connected = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -329,33 +592,77 @@ enum Docker {
         }
         guard connected == 0 else { return nil }
 
-        let req = "\(method) \(path) HTTP/1.0\r\nHost: docker\r\nContent-Length: 0\r\n\r\n"
+        // Docker Desktop closes after one HTTP/1.0 response. OrbStack's socket
+        // answers HTTP/1.1 with chunked encoding and keeps the connection open
+        // regardless, so stop at the final chunk (or Content-Length) and dechunk.
+        let req = "\(method) \(path) HTTP/1.1\r\nHost: docker\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
         guard req.withCString({ write(fd, $0, strlen($0)) }) > 0 else { return nil }
 
+        let crlf2 = Data("\r\n\r\n".utf8)
         var data = Data()
-        var chunk = [UInt8](repeating: 0, count: 65536)
+        var buf = [UInt8](repeating: 0, count: 65536)
+        var head: String?
+        var bodyStart = 0
+        var chunked = false
+        var length: Int?
         while true {
-            let n = read(fd, &chunk, chunk.count)
+            let n = read(fd, &buf, buf.count)
             if n <= 0 { break }
-            data.append(chunk, count: n)
+            data.append(buf, count: n)
+            if head == nil, let split = data.range(of: crlf2) {
+                head = String(decoding: data[..<split.lowerBound], as: UTF8.self)
+                bodyStart = split.upperBound
+                for line in head!.split(separator: "\r\n") {
+                    let l = line.lowercased()
+                    if l.hasPrefix("transfer-encoding:") && l.contains("chunked") { chunked = true }
+                    if l.hasPrefix("content-length:") {
+                        length = Int(l.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces))
+                    }
+                }
+            }
+            guard head != nil else { continue }
+            if chunked, data.suffix(5) == Data("0\r\n\r\n".utf8) { break }
+            if let length, data.count - bodyStart >= length { break }
         }
-        guard let split = data.range(of: Data("\r\n\r\n".utf8)),
-              let head = String(data: data[..<split.lowerBound], encoding: .utf8),
+        guard let head,
               let code = head.split(separator: " ").dropFirst().first.flatMap({ Int($0) }),
               (200..<300).contains(code) else { return nil }
-        return data[split.upperBound...]
+        let body = data[bodyStart...]
+        return chunked ? dechunk(body) : body
     }
 
-    static func json(_ path: String) -> Any? {
-        request("GET", path).flatMap { try? JSONSerialization.jsonObject(with: $0) }
+    // "b12\r\n<2834 bytes>\r\n0\r\n\r\n" -> the bytes.
+    static func dechunk(_ body: Data) -> Data {
+        var out = Data()
+        var i = body.startIndex
+        let crlf = Data("\r\n".utf8)
+        while i < body.endIndex, let line = body[i...].range(of: crlf) {
+            let sizeText = String(decoding: body[i..<line.lowerBound], as: UTF8.self)
+                .split(separator: ";").first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+            guard let size = Int(sizeText, radix: 16), size > 0 else { break }
+            let start = line.upperBound
+            let end = min(start + size, body.endIndex)
+            out.append(body[start..<end])
+            i = end + 2
+        }
+        return out
     }
 
-    static var isUp: Bool {
-        request("GET", "/_ping", timeout: 1).map { String(decoding: $0, as: UTF8.self) } == "OK"
+    static func json(_ engine: Engine, _ path: String) -> Any? {
+        request(engine, "GET", path).flatMap { try? JSONSerialization.jsonObject(with: $0) }
     }
 
-    static func stop(_ name: String) { _ = request("POST", "/containers/\(name)/stop", timeout: 30) }
-    static func start(_ name: String) { _ = request("POST", "/containers/\(name)/start", timeout: 30) }
+    static func isUp(_ engine: Engine) -> Bool {
+        request(engine, "GET", "/_ping", timeout: 1).map { String(decoding: $0, as: UTF8.self) } == "OK"
+    }
+
+    static func stop(_ e: Engine, _ name: String) { _ = request(e, "POST", "/containers/\(name)/stop", timeout: 30) }
+    static func start(_ e: Engine, _ name: String) { _ = request(e, "POST", "/containers/\(name)/start", timeout: 30) }
+    static func stop(_ c: Container) { stop(engine(of: c), c.name) }
+    static func start(_ c: Container) { start(engine(of: c), c.name) }
+    static func engine(of c: Container) -> Engine {
+        Engine.known.first { $0.name == c.engine } ?? .docker
+    }
 
     // "Up 9 hours (healthy)" -> "9 hr", "Up About an hour" -> "1 hr"
     static func shortUptime(_ status: String) -> String {
@@ -374,13 +681,16 @@ enum Docker {
 // Lists running containers with CPU and memory. Keeps the previous CPU counters
 // because one-shot stats carry no "previous" sample of their own.
 final class DockerScanner: @unchecked Sendable {
+    let engine: Engine
     private var lastCPU: [String: (container: UInt64, system: UInt64)] = [:]
+
+    init(_ engine: Engine) { self.engine = engine }
 
     func scan() -> [Container]? {
         // Running plus restarting: a crash loop is exactly what we want to catch.
         let filter = #"{"status":["running","restarting"]}"#
             .addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
-        guard let list = Docker.json("/containers/json?filters=\(filter)") as? [[String: Any]]
+        guard let list = Docker.json(engine, "/containers/json?filters=\(filter)") as? [[String: Any]]
         else { return nil }
         var next: [String: (UInt64, UInt64)] = [:]
         let containers: [Container] = list.compactMap { c in
@@ -389,12 +699,12 @@ final class DockerScanner: @unchecked Sendable {
             let labels = c["Labels"] as? [String: String] ?? [:]
             let port = (c["Ports"] as? [[String: Any]])?.compactMap { $0["PublicPort"] as? Int }.first
             var item = Container(
-                name: name, image: c["Image"] as? String ?? "",
+                engine: engine.name, name: name, image: c["Image"] as? String ?? "",
                 project: labels["com.docker.compose.project"] ?? "", port: port,
                 uptime: Docker.shortUptime(c["Status"] as? String ?? ""))
             item.restarting = (c["State"] as? String) == "restarting"
 
-            if let st = Docker.json("/containers/\(name)/stats?stream=false&one-shot=true")
+            if let st = Docker.json(engine, "/containers/\(name)/stats?stream=false&one-shot=true")
                 as? [String: Any] {
                 let mem = st["memory_stats"] as? [String: Any] ?? [:]
                 let usage = (mem["usage"] as? NSNumber)?.doubleValue ?? 0
@@ -448,19 +758,22 @@ final class Model: ObservableObject {
     private(set) var memHistory: [Double] = []  // GB used
     private(set) var swapHistory: [Double] = []  // GB
     private(set) var apps: [AppUsage] = []
-    private(set) var containers: [Container] = []  // running
+    private(set) var engines: [Engine] = []  // container engines running right now
+    private(set) var containers: [Container] = []  // running, across engines
+    private(set) var scannedContainers = false  // at least once since the popover opened
     private(set) var reasons: [String] = []
     private(set) var cause = Cause.none
     private(set) var cpuSplit: (user: Double, system: Double) = (0, 0)  // percent of the whole Mac
     private(set) var disk: (free: Double, total: Double)?
     private var tickCount = 0
-    private(set) var dockerState = DockerState.off
-    private var dockerFailures = 0
+    private(set) var engineState: [String: DockerState] = [:]  // by Engine.name
+    private var failures: [String: Int] = [:]  // container scans missed in a row, by Engine.name
 
     // State the user changes.
     @Published var stoppedHere: [Container] = []  // stopped from this popover, offered for Start
-    @Published var busy: Set<String> = []  // containers being stopped or started
+    @Published var busy: Set<String> = []  // container ids being stopped or started
     @Published var expanded: Set<String> = []  // projects shown open
+    @Published var expandedApps: Set<String> = []  // apps showing their breakdown
     @Published var restartStatus: String?  // non-nil while restarting Docker
     @Published var confirmRestart = false
 
@@ -471,9 +784,14 @@ final class Model: ObservableObject {
     private var openTicks = 0
     private let queue = DispatchQueue(label: "headroom.scan", qos: .utility)
     private let procs = ProcScanner()
-    private let docker = DockerScanner()
+    private let scanners = Engine.known.map(DockerScanner.init)
 
     init() {
+        let args = CommandLine.arguments
+        if args.contains("--dump") { dump() }
+        if let i = args.firstIndex(of: "--screenshot"), i + 1 < args.count {
+            DispatchQueue.main.async { self.screenshot(to: args[i + 1]) }
+        }
         tickSystem()
         systemTimer = Timer.scheduledTimer(withTimeInterval: Self.tick, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tickSystem() }
@@ -503,7 +821,9 @@ final class Model: ObservableObject {
         appTimer?.invalidate()
         appTimer = nil
         expanded = []
+        expandedApps = []
         stoppedHere = []
+        scannedContainers = false
         confirmRestart = false
     }
 
@@ -562,38 +882,54 @@ final class Model: ObservableObject {
 
     func scanApps() {
         guard isOpen else { return }
-        let withDocker = restartStatus == nil && openTicks % 2 == 0  // every 4 s
+        let withContainers = openTicks % 2 == 0  // every 4 s
         openTicks += 1
-        // Docker Desktop running is what matters, not the VM: when the VM dies
+        // An engine's app running is what matters, not its VM: when the VM dies
         // the app stays up and its socket stops answering.
-        let desktopRunning = !NSRunningApplication
-            .runningApplications(withBundleIdentifier: "com.docker.docker").isEmpty
-        queue.async { [procs, docker] in
+        let running = Engine.known.filter { e in
+            !NSRunningApplication.runningApplications(withBundleIdentifier: e.bundleID).isEmpty
+        }
+        let restarting = restartStatus != nil
+        queue.async { [procs, scanners] in
             let apps = procs.scan()
-            let containers = withDocker && desktopRunning ? docker.scan() : nil
+            var scanned: [String: [Container]] = [:]  // engines whose socket answered
+            if withContainers {
+                for s in scanners where running.contains(s.engine) && (s.engine != .docker || !restarting) {
+                    if let list = s.scan() { scanned[s.engine.name] = list }
+                }
+            }
             DispatchQueue.main.async {
                 self.apps = apps
-                if self.restartStatus != nil {
-                    // leave Docker alone mid-restart
-                } else if !desktopRunning {
-                    self.containers = []
-                    self.dockerState = .off
-                    self.dockerFailures = 0
-                } else if let containers {
-                    self.containers = containers
-                    self.stoppedHere.removeAll { c in containers.contains { $0.name == c.name } }
-                    self.dockerState = .up
-                    self.dockerFailures = 0
-                    self.rememberRunning(containers)
-                } else if withDocker {
-                    // Two misses in a row (8 s), so Docker starting up doesn't count.
-                    self.dockerFailures += 1
-                    if self.dockerFailures >= 2 {
-                        self.dockerState = .unresponsive
-                        self.containers = []
-                    }
+                self.engines = running
+                for e in Engine.known where e != .docker || self.restartStatus == nil {  // leave Docker alone mid-restart
+                    self.update(e, running: running.contains(e), scanned: scanned[e.name],
+                                tried: withContainers)
                 }
                 if self.isOpen { self.objectWillChange.send() }
+            }
+        }
+    }
+
+    // One engine's containers after a scan. Two misses in a row (8 s) mean it
+    // stopped answering; a single miss is just the engine still starting up.
+    private func update(_ e: Engine, running: Bool, scanned: [Container]?, tried: Bool) {
+        if !running {
+            containers.removeAll { $0.engine == e.name }
+            engineState[e.name] = .off
+            failures[e.name] = 0
+        } else if let list = scanned {
+            containers.removeAll { $0.engine == e.name }
+            containers += list
+            scannedContainers = true
+            stoppedHere.removeAll { c in list.contains { $0.id == c.id } }
+            engineState[e.name] = .up
+            failures[e.name] = 0
+            rememberRunning(e, list)
+        } else if tried {
+            failures[e.name, default: 0] += 1
+            if failures[e.name]! >= 2 {
+                engineState[e.name] = .unresponsive
+                containers.removeAll { $0.engine == e.name }
             }
         }
     }
@@ -602,13 +938,13 @@ final class Model: ObservableObject {
 
     // The containers running at the last good scan, databases first. If Docker
     // breaks, these are what a restart brings back.
-    var lastRunning: [String] {
-        UserDefaults.standard.stringArray(forKey: Pref.lastContainers) ?? []
+    func lastRunning(_ e: Engine) -> [String] {
+        UserDefaults.standard.stringArray(forKey: e.lastContainersKey) ?? []
     }
 
-    private func rememberRunning(_ list: [Container]) {
+    private func rememberRunning(_ e: Engine, _ list: [Container]) {
         let names = list.filter { !$0.restarting }.sorted { $0.isInfra && !$1.isInfra }.map(\.name)
-        if names != lastRunning { UserDefaults.standard.set(names, forKey: Pref.lastContainers) }
+        if names != lastRunning(e) { UserDefaults.standard.set(names, forKey: e.lastContainersKey) }
     }
 
     private func push(_ a: inout [Double], _ v: Double) {
@@ -663,9 +999,13 @@ final class Model: ObservableObject {
         if status.verdict != v { status.verdict = v }
     }
 
-    // MARK: Docker
+    // MARK: Containers
 
-    var dockerVM: AppUsage? { apps.first { $0.isDockerVM } }
+    // Engines with a card: the running ones, plus Docker while it restarts.
+    // Following Engine.known keeps the order stable while Docker quits and starts.
+    var engineCards: [Engine] {
+        Engine.known.filter { engines.contains($0) || ($0 == .docker && restartStatus != nil) }
+    }
 
     // The app most responsible for the current verdict, e.g. "Chrome is using 6.1 GB".
     var culprit: String? {
@@ -675,73 +1015,90 @@ final class Model: ObservableObject {
             return nil
         case .memory:
             guard let top = candidates.max(by: { $0.mb < $1.mb }), top.mb >= 500 else { return nil }
-            if top.isDockerVM, let c = containers.max(by: { ($0.mb ?? 0) < ($1.mb ?? 0) }), (c.mb ?? 0) > 0 {
-                return "Docker is using \(formatMB(top.mb)), most of it \(c.name)"
+            if let e = engine(of: top), let c = containers(e).max(by: { ($0.mb ?? 0) < ($1.mb ?? 0) }),
+               (c.mb ?? 0) > 0 {
+                return "\(e.name) is using \(formatMB(top.mb)), most of it \(c.name)"
             }
             return "\(top.name) is using \(formatMB(top.mb))"
         case .cpu:
             // Per-core percentages pass 100 ("773%"); a share of the whole Mac reads better here.
             // Under 10% it isn't a culprit, e.g. when heat alone is the cause.
-            let cores = Double(ProcessInfo.processInfo.activeProcessorCount)
             let top = candidates.max(by: { $0.cpu < $1.cpu })
             // CPU we can't attribute to your apps belongs to macOS itself: Spotlight,
             // WindowServer, kernel_task. Those run as root, so we can't see them one by one.
-            let system = cpuNow * cores - candidates.reduce(0) { $0 + $1.cpu }
-            if system / cores >= 10 && system > (top?.cpu ?? 0) {
-                return String(format: "macOS system processes are using %.0f%% of your CPU", min(system / cores, 100))
+            let system = cpuNow * coreCount - candidates.reduce(0) { $0 + $1.cpu }
+            if system / coreCount >= 10 && system > (top?.cpu ?? 0) {
+                return String(format: "macOS system processes are using %.0f%% of your CPU", cpuShare(system))
             }
-            guard let top, top.cpu / cores >= 10 else { return nil }
-            let share = min(top.cpu / cores, 100)
-            if top.isDockerVM, let c = containers.max(by: { ($0.cpu ?? 0) < ($1.cpu ?? 0) }), (c.cpu ?? 0) >= 5 {
-                return String(format: "Docker (%@) is using %.0f%% of your CPU", c.name, share)
+            guard let top, cpuShare(top.cpu) >= 10 else { return nil }
+            let share = cpuShare(top.cpu)
+            if let e = engine(of: top), let c = containers(e).max(by: { ($0.cpu ?? 0) < ($1.cpu ?? 0) }),
+               (c.cpu ?? 0) >= 5 {
+                return String(format: "%@ (%@) is using %.0f%% of your CPU", e.name, c.name, share)
             }
             return String(format: "%@ is using %.0f%% of your CPU", top.name, share)
         }
     }
 
-    // Running and just-stopped containers, grouped by compose project.
-    var projects: [(name: String, items: [Container])] {
-        Dictionary(grouping: containers + stoppedHere, by: \.project)
+    func engine(of app: AppUsage) -> Engine? { Engine.known.first { $0.name == app.name } }
+
+    func app(_ engine: Engine) -> AppUsage? { apps.first { $0.name == engine.name } }
+
+    func state(_ engine: Engine) -> DockerState { engineState[engine.name] ?? .off }
+
+    func containers(_ engine: Engine) -> [Container] { containers.filter { $0.engine == engine.name } }
+
+    // Running and just-stopped containers of one engine, grouped by compose project.
+    func projects(_ engine: Engine) -> [(name: String, items: [Container])] {
+        Dictionary(grouping: (containers + stoppedHere).filter { $0.engine == engine.name }, by: \.project)
             .map { ($0.key, $0.value.sorted { $0.name < $1.name }) }
             .sorted { $0.name < $1.name }
     }
 
-    func isStopped(_ c: Container) -> Bool { stoppedHere.contains { $0.name == c.name } }
+    func isStopped(_ c: Container) -> Bool { stoppedHere.contains { $0.id == c.id } }
 
     // Memory the VM holds beyond what its containers use, once stats are in.
-    var vmSlackMB: Double? {
-        guard let vm = dockerVM, !containers.isEmpty,
-              containers.allSatisfy({ $0.mb != nil }) else { return nil }
-        return vm.mb - containers.reduce(0) { $0 + ($1.mb ?? 0) }
+    func vmSlackMB(_ engine: Engine) -> Double? {
+        let cs = containers(engine)
+        guard engine.canReclaim, let app = app(engine), !cs.isEmpty,
+              cs.allSatisfy({ $0.mb != nil }) else { return nil }
+        return app.vmMB - cs.reduce(0) { $0 + ($1.mb ?? 0) }
     }
 
     func toggle(_ project: String) {
         if expanded.contains(project) { expanded.remove(project) } else { expanded.insert(project) }
     }
 
-    func stop(_ names: [String]) {
-        guard !names.isEmpty else { return }
-        busy.formUnion(names)
+    func toggle(_ app: AppUsage) {
+        if expandedApps.contains(app.name) { expandedApps.remove(app.name) }
+        else { expandedApps.insert(app.name) }
+    }
+
+    func stop(_ cs: [Container]) {
+        guard !cs.isEmpty else { return }
+        let ids = Set(cs.map(\.id))
+        busy.formUnion(ids)
         DispatchQueue.global(qos: .userInitiated).async {
-            DispatchQueue.concurrentPerform(iterations: names.count) { Docker.stop(names[$0]) }
+            DispatchQueue.concurrentPerform(iterations: cs.count) { Docker.stop(cs[$0]) }
             DispatchQueue.main.async {
-                self.busy.subtract(names)
-                let gone = self.containers.filter { names.contains($0.name) }
-                self.containers.removeAll { names.contains($0.name) }
+                self.busy.subtract(ids)
+                let gone = self.containers.filter { ids.contains($0.id) }
+                self.containers.removeAll { ids.contains($0.id) }
                 self.stoppedHere += gone
                 self.scanApps()
             }
         }
     }
 
-    func start(_ names: [String]) {
-        guard !names.isEmpty else { return }
-        busy.formUnion(names)
+    func start(_ cs: [Container]) {
+        guard !cs.isEmpty else { return }
+        let ids = Set(cs.map(\.id))
+        busy.formUnion(ids)
         DispatchQueue.global(qos: .userInitiated).async {
-            names.forEach(Docker.start)
+            cs.forEach(Docker.start)
             DispatchQueue.main.async {
-                self.busy.subtract(names)
-                self.openTicks = 0  // make the next scan include Docker
+                self.busy.subtract(ids)
+                self.openTicks = 0  // make the next scan include containers
                 self.scanApps()
             }
         }
@@ -751,28 +1108,30 @@ final class Model: ObservableObject {
     // without a restart policy stay down after that, so start them again ourselves.
     func restartDocker() {
         confirmRestart = false
-        let names = containers.isEmpty ? lastRunning
-                                       : containers.sorted { $0.isInfra && !$1.isInfra }.map(\.name)
+        let engine = Engine.docker
+        let current = containers(engine)
+        let names = current.isEmpty ? lastRunning(engine)
+                                    : current.sorted { $0.isInfra && !$1.isInfra }.map(\.name)
         restartStatus = "Quitting Docker…"
-        dockerState = .up
-        dockerFailures = 0
+        engineState[engine.name] = .up
+        failures[engine.name] = 0
         DispatchQueue.global(qos: .userInitiated).async {
             NSAppleScript(source: "quit app \"Docker\"")?.executeAndReturnError(nil)
             var waited = 0
-            while Docker.isUp && waited < 60 { Thread.sleep(forTimeInterval: 1); waited += 1 }
+            while Docker.isUp(engine) && waited < 60 { Thread.sleep(forTimeInterval: 1); waited += 1 }
             Thread.sleep(forTimeInterval: 5)  // let the backend exit before reopening
 
             DispatchQueue.main.async {
                 self.restartStatus = "Starting Docker…"
-                NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: "/Applications/Docker.app"),
+                NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: engine.appPath),
                                                    configuration: .init())
             }
             waited = 0
-            while !Docker.isUp && waited < 180 { Thread.sleep(forTimeInterval: 1); waited += 1 }
+            while !Docker.isUp(engine) && waited < 180 { Thread.sleep(forTimeInterval: 1); waited += 1 }
 
             if !names.isEmpty {
                 DispatchQueue.main.async { self.restartStatus = "Starting \(names.count) containers…" }
-                names.forEach(Docker.start)
+                names.forEach { Docker.start(engine, $0) }
             }
             DispatchQueue.main.async {
                 self.restartStatus = nil
@@ -784,10 +1143,78 @@ final class Model: ObservableObject {
 
     // MARK: Apps
 
+    // `Headroom.app/Contents/MacOS/Headroom --screenshot out.png [App …]`: shows
+    // the popover's content in a window of its own, waits for the first scans,
+    // expands the named apps, and saves the result. It is our own window, so no
+    // screen recording permission is needed. For the README and for checking
+    // layout changes without reaching for the mouse.
+    private func screenshot(to path: String) {
+        // A plain background stands in for the popover's blur, which only the
+        // window server can draw.
+        let effect = NSView()
+        effect.wantsLayer = true
+        effect.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        let host = NSHostingView(rootView: ContentView(model: self))
+        host.autoresizingMask = [.width, .height]
+        effect.addSubview(host)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 400),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = effect
+        window.center()
+        window.orderFrontRegardless()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 9) {
+            let args = CommandLine.arguments
+            let names = args[(args.firstIndex(of: "--screenshot")! + 2)...]
+            self.expandedApps = Set(names)
+            self.expanded = Set(self.engines.flatMap { e in self.projects(e).map { e.name + "/" + $0.name } })
+            self.objectWillChange.send()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                let size = host.fittingSize
+                window.setContentSize(size)
+                host.frame = effect.bounds
+                window.displayIfNeeded()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    if let rep = effect.bitmapImageRepForCachingDisplay(in: effect.bounds) {
+                        effect.cacheDisplay(in: effect.bounds, to: rep)
+                        if let png = rep.representation(using: .png, properties: [:]) {
+                            try? png.write(to: URL(fileURLWithPath: path))
+                            print("saved \(path) (\(Int(size.width))×\(Int(size.height)) pt)")
+                        }
+                    }
+                    exit(0)
+                }
+            }
+        }
+    }
+
+    // `Headroom.app/Contents/MacOS/Headroom --dump`: prints every app and its
+    // breakdown to the terminal, for checking how processes get grouped.
+    private func dump() {
+        for app in procs.scan().sorted(by: { $0.mb > $1.mb }) where app.mb >= 50 {
+            print(String(format: "%@  %@  %d proc%@%@", formatMB(app.mb), app.name, app.count,
+                         app.count == 1 ? "" : "s", app.isSystem ? "  (system)" : ""))
+            for part in app.parts.sorted(by: { $0.mb > $1.mb }).prefix(8) {
+                let pids = app.procs.filter { $0.label == part.label }.prefix(6).map { String($0.pid) }
+                print(String(format: "    %@  %@%@%@  pid %@", formatMB(part.mb), part.label,
+                             part.count > 1 ? " ×\(part.count)" : "",
+                             part.detail.map { "  (\($0))" } ?? "", pids.joined(separator: ",")))
+            }
+        }
+        exit(0)
+    }
+
     func quit(_ app: AppUsage) {
-        guard let path = app.bundlePath else { return }
-        for r in NSWorkspace.shared.runningApplications where r.bundleURL?.path == path {
-            r.terminate()
+        for r in running(app) { r.terminate() }
+    }
+
+    // Apple's apps run from a cryptex, so compare bundle names, not full paths:
+    // /Applications/Safari.app is a link to /System/Volumes/Preboot/Cryptexes/…/Safari.app.
+    func running(_ app: AppUsage) -> [NSRunningApplication] {
+        guard let path = app.bundlePath else { return [] }
+        let name = (path as NSString).lastPathComponent
+        return NSWorkspace.shared.runningApplications.filter {
+            $0.bundleURL.map { $0.path == path || $0.lastPathComponent == name } ?? false
         }
     }
 }
@@ -964,6 +1391,7 @@ struct ContentView: View {
     @State private var showSettings = false
     @AppStorage(Pref.appCount) private var appCount = 5
     @AppStorage(Pref.showDocker) private var showDocker = true
+    @AppStorage("showAllApps") private var showAll = false  // "More…" stays on until "Less"
 
     var body: some View {
         VStack(spacing: 8) {
@@ -973,8 +1401,8 @@ struct ContentView: View {
                 header
                 HStack(spacing: 8) { tiles }
                 appsCard
-                if showDocker && (model.dockerState != .off || model.restartStatus != nil) {
-                    DockerCard(model: model)
+                if showDocker {
+                    ForEach(model.engineCards) { EngineCard(engine: $0, model: model) }
                 }
                 footer
             }
@@ -1075,16 +1503,21 @@ struct ContentView: View {
     // MARK: Apps
 
     var appsCard: some View {
-        let all = model.apps.filter { !$0.isDockerVM && $0.name != "Headroom" }
+        // Container engines get their own card below, with the same total.
+        let engines: Set<String> = showDocker ? Set(model.engineCards.map(\.name)) : []
+        let all = model.apps.filter { !engines.contains($0.name) && $0.name != "Headroom" }
         let key: (AppUsage) -> Double = { sort == .memory ? $0.mb : $0.cpu }
-        let rows = Array(all.sorted { key($0) > key($1) }.prefix(appCount))
+        let sorted = all.sorted { key($0) > key($1) }
+        // "More" lists everything that amounts to anything, in a scrolling list.
+        let rows = showAll ? sorted.filter { $0.mb >= 10 || $0.cpu >= 1 } : Array(sorted.prefix(appCount))
         let top = max(rows.first.map(key) ?? 1, 1)
 
         return Card {
             VStack(spacing: 2) {
                 HStack {
                     // Only when the Mac actually is slow: a big app on a healthy Mac isn't slowing you down.
-                    Text(model.status.verdict != .smooth && rows.contains { isHot($0) } ? "Slowing you down" : "Top apps")
+                    Text(model.status.verdict != .smooth && rows.contains { isHot($0) } ? "Slowing you down"
+                         : showAll ? "All apps" : "Top apps")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -1106,10 +1539,30 @@ struct ContentView: View {
                 if rows.isEmpty {
                     ProgressView().controlSize(.small).frame(height: 26 * CGFloat(appCount))
                 }
-                ForEach(rows) { app in
+                let list = ForEach(rows) { app in
                     AppRow(app: app, sort: sort, share: key(app) / top, hot: isHot(app),
                            model: model)
+                    if model.expandedApps.contains(app.name) {
+                        Breakdown(app: app, sort: sort)
+                    }
                 }
+                // Rows have fixed heights, so the list's height is arithmetic:
+                // as tall as its content, up to about 14 rows, then it scrolls (in both modes).
+                do {
+                    let height = rows.reduce(CGFloat(0)) { h, app in
+                        let open = model.expandedApps.contains(app.name)
+                        let parts = open ? min(app.parts.count, Breakdown.maxRows + 1) : 0
+                        return h + 26 + 2 + CGFloat(parts) * (24 + 2)
+                    }
+                    ScrollView(.vertical, showsIndicators: false) { VStack(spacing: 2) { list } }
+                        .frame(height: min(height, 26 * 14))
+                }
+
+                Button(showAll ? "Less" : "More…") { showAll.toggle() }
+                    .buttonStyle(.hoverSmall)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.top, 4)
+                    .help(showAll ? "Back to the top \(appCount)" : "Every app, with a breakdown for each")
             }
         }
     }
@@ -1281,7 +1734,7 @@ struct ShareBar: View {
                     .frame(width: max(4, g.size.width * min(max(share, 0), 1)))
             }
         }
-        .frame(width: 64, height: 5)
+        .frame(width: 56, height: 5)
     }
 }
 
@@ -1295,7 +1748,15 @@ struct AppRow: View {
     @State private var confirming = false
 
     var body: some View {
+        let open = model.expandedApps.contains(app.name)
         HStack(spacing: 8) {
+            Image(systemName: "chevron.right")
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(.secondary)
+                .rotationEffect(.degrees(open ? 90 : 0))
+                .animation(.snappy(duration: 0.15), value: open)
+                .opacity(app.hasBreakdown ? 1 : 0)
+                .frame(width: 8)
             icon.frame(width: 18, height: 18)
             if confirming {
                 // Same row, same height: the confirm swaps in without resizing the popover.
@@ -1330,6 +1791,7 @@ struct AppRow: View {
             .fill(hovering ? Color.hover : .clear))
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
+        .onTapGesture { if app.hasBreakdown && !confirming { model.toggle(app) } }
         .onDisappear { confirming = false }
         .help(tooltip)
     }
@@ -1337,6 +1799,7 @@ struct AppRow: View {
     var tooltip: String {
         var parts = [formatMB(app.mb), String(format: "%.0f%% CPU", cpuShare(app.cpu))]
         if app.count > 1 { parts.append("\(app.count) processes") }
+        if app.hasBreakdown { parts.append("click for a breakdown") }
         return parts.joined(separator: " · ")
     }
 
@@ -1344,7 +1807,8 @@ struct AppRow: View {
         if let path = app.bundlePath, let img = Icons.app(path) {
             Image(nsImage: img).resizable()
         } else {
-            Image(systemName: app.name == "Claude Code" ? "terminal.fill" : "gearshape.fill")
+            // Command-line things get a terminal; macOS internals a gear.
+            Image(systemName: app.isSystem ? "gearshape.fill" : "terminal.fill")
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
                 .frame(width: 18, height: 18)
@@ -1353,42 +1817,135 @@ struct AppRow: View {
     }
 
     var canQuit: Bool {
-        guard let path = app.bundlePath, !app.isSystem else { return false }
-        return NSWorkspace.shared.runningApplications.contains { $0.bundleURL?.path == path }
+        !app.isSystem && !model.running(app).isEmpty
     }
 }
 
-// MARK: Docker card
+// MARK: App breakdown
+
+// What an app's memory is made of: the scripts a Python runs, a browser's
+// tabs and extensions, an IDE next to its helpers. Biggest rows first; the
+// long tail folds into one line so the popover stays short.
+struct Breakdown: View {
+    let app: AppUsage
+    let sort: SortKey
+    static let maxRows = 6
+
+    var body: some View {
+        let key: (AppPart) -> Double = { sort == .memory ? $0.mb : $0.cpu }
+        let parts = app.parts.sorted { key($0) > key($1) }
+        let shown = parts.prefix(Self.maxRows)
+        let rest = parts.dropFirst(Self.maxRows)
+        ForEach(shown) { PartRow(part: $0, sort: sort) }
+        if !rest.isEmpty {
+            PartRow(part: AppPart(label: "\(rest.count) more", detail: nil,
+                                  mb: rest.reduce(0) { $0 + $1.mb }, cpu: rest.reduce(0) { $0 + $1.cpu },
+                                  count: rest.reduce(0) { $0 + $1.count }),
+                    sort: sort, isTail: true)
+        }
+    }
+}
+
+struct PartRow: View {
+    let part: AppPart
+    let sort: SortKey
+    var isTail = false
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(part.label)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .foregroundStyle(isTail ? .secondary : .primary)
+                .layoutPriority(1)
+            if part.count > 1 && !isTail {
+                Text("×\(part.count)").foregroundStyle(.secondary).monospacedDigit().fixedSize()
+            }
+            Spacer(minLength: 6)
+            if let folder = shortFolder {
+                // Drop the folder when there is no room, rather than showing a lone "…".
+                ViewThatFits(in: .horizontal) {
+                    Text(folder).font(.caption).foregroundStyle(.secondary).lineLimit(1).fixedSize()
+                    Color.clear.frame(width: 0)
+                }
+            }
+            Text(sort == .memory ? formatMB(part.mb) : String(format: "%.0f%%", cpuShare(part.cpu)))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(width: 58, alignment: .trailing)
+        }
+        .font(.callout)
+        .padding(.leading, 40)
+        .padding(.horizontal, 6)
+        .frame(height: 24)
+        .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .fill(hovering ? Color.hover : .clear))
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .help(tooltip)
+    }
+
+    // The row has room for a folder name, not a path: "~/Code/AI/workflows/src/jev"
+    // -> "workflows/src/jev". The full path is in the tooltip. Other details
+    // ("largest 1.4 GB") stay in the tooltip too.
+    var shortFolder: String? {
+        guard let d = part.detail, d.hasPrefix("~") || d.hasPrefix("/") else { return nil }
+        let parts = d.split(separator: "/").map(String.init)
+        let noise = ["src", "dist", "lib", "bin", "build", "out", "scripts"]
+        guard let last = parts.last else { return nil }
+        if noise.contains(last), parts.count >= 2 {
+            return parts.suffix(3).joined(separator: "/")
+        }
+        // CLI tools are already labelled by their folder; don't say it twice.
+        return last == part.label ? nil : last
+    }
+
+    // "serve.py · ~/Documents/Code/AI/workflows · 248 MB · 3% CPU"
+    var tooltip: String {
+        var parts = [part.label]
+        if let detail = part.detail { parts.append(detail) }
+        if part.count > 1 { parts.append("\(part.count) processes") }
+        parts += [formatMB(part.mb), String(format: "%.0f%% CPU", cpuShare(part.cpu))]
+        return parts.joined(separator: " · ")
+    }
+}
+
+// MARK: Container engine card
 
 // Expanding and collapsing is deliberately not animated: the popover window
 // resizes to fit, and animating that resize makes the whole window flicker.
-struct DockerCard: View {
+struct EngineCard: View {
+    let engine: Engine
     @ObservedObject var model: Model
 
     var body: some View {
+        let app = model.app(engine)
+        let projects = model.projects(engine)
+        let restarting = engine == .docker ? model.restartStatus : nil
         Card {
             VStack(spacing: 2) {
                 HStack(spacing: 6) {
-                    if let img = Icons.app("/Applications/Docker.app") {
+                    if let img = Icons.app(engine.appPath) {
                         Image(nsImage: img).resizable().frame(width: 16, height: 16)
                     }
-                    Text("Docker")
+                    Text(engine.name)
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Spacer()
-                    if let vm = model.dockerVM {
-                        let cores = Double(ProcessInfo.processInfo.activeProcessorCount)
-                        Text(String(format: "%@ · %.0f%% CPU", formatMB(vm.mb), min(vm.cpu / cores, 100)))
+                    if let app {
+                        Text(String(format: "%@ · %.0f%% CPU", formatMB(app.mb), cpuShare(app.cpu)))
                             .font(.caption)
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
-                            .help("Memory and CPU of Docker's Linux VM, which runs every container")
+                            .help(String(format: "%@ as a whole. Its Linux VM, which runs every container, holds %@.",
+                                         engine.name, formatMB(app.vmMB)))
                     }
                 }
                 .padding(.horizontal, 6)
                 .padding(.bottom, 2)
 
-                if let status = model.restartStatus {
+                if let status = restarting {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
                         Text(status).foregroundStyle(.secondary)
@@ -1396,28 +1953,33 @@ struct DockerCard: View {
                     }
                     .padding(.horizontal, 6)
                     .frame(height: 28)
-                } else if model.dockerState == .unresponsive {
-                    DockerDownNote(model: model)
+                } else if model.state(engine) == .unresponsive {
+                    DockerDownNote(engine: engine, model: model)
                 } else {
-                    CrashNote(model: model)
-                    ForEach(model.projects, id: \.name) { project in
+                    CrashNote(engine: engine, model: model)
+                    ForEach(projects, id: \.name) { project in
                         ProjectRow(name: project.name, items: project.items, model: model)
-                        if model.expanded.contains(project.name) {
+                        if model.expanded.contains(engine.name + "/" + project.name) {
                             ForEach(project.items) { ContainerRow(c: $0, model: model) }
                         }
                     }
-                    if model.projects.isEmpty {
-                        Text("No containers running")
+                    if projects.isEmpty {
+                        Text(app == nil ? "\(engine.name) isn't running"
+                             : model.containers.isEmpty && model.stoppedHere.isEmpty && !loaded
+                             ? "Loading containers…" : "No containers running")
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 6)
                             .frame(height: 26)
                     }
-                    SlackNote(model: model)
+                    SlackNote(engine: engine, model: model)
                 }
             }
         }
     }
+
+    // The first container scan lands a few seconds after the popover opens.
+    var loaded: Bool { model.scannedContainers }
 }
 
 struct ProjectRow: View {
@@ -1426,11 +1988,14 @@ struct ProjectRow: View {
     @ObservedObject var model: Model
     @State private var hovering = false
 
+    // Projects of different engines may share a name; the toggle key doesn't.
+    var key: String { (items.first?.engine ?? "") + "/" + name }
+
     var body: some View {
         let running = items.filter { !model.isStopped($0) }
         let mb = running.reduce(0) { $0 + ($1.mb ?? 0) }
-        let anyBusy = items.contains { model.busy.contains($0.name) }
-        let open = model.expanded.contains(name)
+        let anyBusy = items.contains { model.busy.contains($0.id) }
+        let open = model.expanded.contains(key)
 
         HStack(spacing: 8) {
             Image(systemName: "chevron.right")
@@ -1454,13 +2019,11 @@ struct ProjectRow: View {
                 ProgressView().controlSize(.mini)
             } else if hovering {
                 if running.isEmpty {
-                    Button("Start") { model.start(items.map(\.name)) }
+                    Button("Start") { model.start(items) }
                         .buttonStyle(.hoverSmall)
                 } else {
-                    Button(running.count == 1 ? "Stop" : "Stop All") {
-                        model.stop(running.map(\.name))
-                    }
-                    .buttonStyle(.hoverSmall)
+                    Button(running.count == 1 ? "Stop" : "Stop All") { model.stop(running) }
+                        .buttonStyle(.hoverSmall)
                 }
             }
             Text(running.isEmpty ? "Stopped" : mb > 0 ? formatMB(mb) : "")
@@ -1474,7 +2037,7 @@ struct ProjectRow: View {
             .fill(hovering ? Color.hover : .clear))
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
-        .onTapGesture { model.toggle(name) }
+        .onTapGesture { model.toggle(key) }
     }
 }
 
@@ -1485,7 +2048,7 @@ struct ContainerRow: View {
 
     var body: some View {
         let stopped = model.isStopped(c)
-        let busy = model.busy.contains(c.name)
+        let busy = model.busy.contains(c.id)
 
         HStack(spacing: 8) {
             Circle()
@@ -1529,7 +2092,7 @@ struct ContainerRow: View {
                 }
                 if hovering {
                     Button(stopped ? "Start" : "Stop") {
-                        stopped ? model.start([c.name]) : model.stop([c.name])
+                        stopped ? model.start([c]) : model.stop([c])
                     }
                     .buttonStyle(.hoverSmall)
                 }
@@ -1562,10 +2125,11 @@ struct ContainerRow: View {
 // A container stuck restarting burns CPU and can kick off other work on every
 // start (on Sep 24 one re-ran a chown that made Spotlight re-index 217 PDFs a minute).
 struct CrashNote: View {
+    let engine: Engine
     @ObservedObject var model: Model
 
     var body: some View {
-        let crashing = model.containers.filter(\.restarting)
+        let crashing = model.containers(engine).filter(\.restarting)
         if !crashing.isEmpty {
             HStack(spacing: 6) {
                 Image(systemName: "arrow.triangle.2.circlepath").foregroundStyle(Color.warnText)
@@ -1574,7 +2138,7 @@ struct CrashNote: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer()
-                Button(crashing.count == 1 ? "Stop" : "Stop All") { model.stop(crashing.map(\.name)) }
+                Button(crashing.count == 1 ? "Stop" : "Stop All") { model.stop(crashing) }
                     .buttonStyle(.hoverSmall)
             }
             .font(.callout)
@@ -1582,32 +2146,37 @@ struct CrashNote: View {
             .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(Color.orange.opacity(0.12)))
             .padding(.bottom, 4)
-            .help("Docker keeps restarting \(crashing.count == 1 ? "this container" : "these containers") because \(crashing.count == 1 ? "it exits" : "they exit") on start. Stopping ends the loop until you start \(crashing.count == 1 ? "it" : "them") again.")
+            .help("\(engine.name) keeps restarting \(crashing.count == 1 ? "this container" : "these containers") because \(crashing.count == 1 ? "it exits" : "they exit") on start. Stopping ends the loop until you start \(crashing.count == 1 ? "it" : "them") again.")
         }
     }
 }
 
-// Docker Desktop is running but its engine stopped answering, usually because
-// the VM died. Restarting brings it back, along with whatever was running.
+// The engine's app is running but its socket stopped answering, usually because
+// the VM died. For Docker, restarting brings it back, along with whatever was
+// running. OrbStack recovers on its own or wants a quit and reopen by hand.
 struct DockerDownNote: View {
+    let engine: Engine
     @ObservedObject var model: Model
 
     var body: some View {
-        let count = model.lastRunning.count
+        let count = model.lastRunning(engine).count
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Color.warnText)
-                Text("Docker isn't responding").fontWeight(.medium)
+                Text("\(engine.name) isn't responding").fontWeight(.medium)
             }
-            Text(count == 0 ? "Restarting Docker usually fixes this."
+            Text(engine != .docker ? "Quitting and reopening \(engine.name) usually fixes this."
+                 : count == 0 ? "Restarting Docker usually fixes this."
                  : "\(count) container\(count == 1 ? " was" : "s were") running. Restarting Docker brings \(count == 1 ? "it" : "them") back.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            HStack {
-                Spacer()
-                Button("Restart Docker") { model.restartDocker() }
-                    .buttonStyle(.hoverProminent(.accentColor))
+            if engine == .docker {
+                HStack {
+                    Spacer()
+                    Button("Restart Docker") { model.restartDocker() }
+                        .buttonStyle(.hoverProminent(.accentColor))
+                }
             }
         }
         .font(.callout)
@@ -1620,10 +2189,11 @@ struct DockerDownNote: View {
 // The VM grows to fit what containers once used and keeps it; only a Docker
 // restart gives it back. One line until clicked, then an inline confirm.
 struct SlackNote: View {
+    let engine: Engine
     @ObservedObject var model: Model
 
     var body: some View {
-        if let slack = model.vmSlackMB, slack >= 2048 {
+        if let slack = model.vmSlackMB(engine), slack >= 2048 {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
                     Image(systemName: "memorychip").foregroundStyle(Color.warnText)
@@ -1636,7 +2206,7 @@ struct SlackNote: View {
                 }
                 .help("Docker's VM keeps memory its containers no longer use. Restarting Docker gives it back to macOS.")
                 if model.confirmRestart {
-                    Text("Docker will quit and reopen, then start your \(model.containers.count) running containers again. Takes about a minute.")
+                    Text("Docker will quit and reopen, then start your \(model.containers(engine).count) running containers again. Takes about a minute.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1729,7 +2299,7 @@ struct SettingsView: View {
                         .fixedSize()
                     }
                     Divider()
-                    SettingRow("Show Docker") { Toggle("Show Docker", isOn: $showDocker) }
+                    SettingRow("Show containers") { Toggle("Show containers", isOn: $showDocker) }
                 }
             }
 
