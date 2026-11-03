@@ -1155,11 +1155,17 @@ final class Model: ObservableObject {
     // screen recording permission is needed. For the README and for checking
     // layout changes without reaching for the mouse.
     private func screenshot(to path: String) {
+        // HEADROOM_APPEARANCE=dark|light shoots either look without touching System Settings.
+        if let a = ProcessInfo.processInfo.environment["HEADROOM_APPEARANCE"] {
+            NSApp.appearance = NSAppearance(named: a == "dark" ? .darkAqua : .aqua)
+        }
         // A plain background stands in for the popover's blur, which only the
         // window server can draw.
         let effect = NSView()
         effect.wantsLayer = true
-        effect.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        NSApp.effectiveAppearance.performAsCurrentDrawingAppearance {
+            effect.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        }
         let host = NSHostingView(rootView: ContentView(model: self))
         host.autoresizingMask = [.width, .height]
         effect.addSubview(host)
@@ -1397,7 +1403,7 @@ struct ContentView: View {
     @State private var showSettings = false
     @AppStorage(Pref.appCount) private var appCount = 5
     @AppStorage(Pref.showDocker) private var showDocker = true
-    @AppStorage("showAllApps") private var showAll = false  // "More…" stays on until "Less"
+    @State private var showAll = false  // "Show all" lasts until the popover closes
 
     var body: some View {
         VStack(spacing: 8) {
@@ -1424,6 +1430,7 @@ struct ContentView: View {
             model.closed()
             confirmQuit = false
             showSettings = false
+            showAll = false
         }
     }
 
@@ -1442,8 +1449,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(v.title).font(.headline)
                     // One line per reason: several can be true at once.
-                    ForEach(model.reasons.isEmpty ? ["Plenty of memory and CPU to spare"] : model.reasons,
-                            id: \.self) { reason in
+                    ForEach(reasons, id: \.self) { reason in
                         Text(reason)
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
@@ -1460,22 +1466,34 @@ struct ContentView: View {
         }
     }
 
+    // The culprit line already names a CPU share; saying "(91%)" twice reads as noise,
+    // and the two numbers differ (30 s average vs now).
+    var reasons: [String] {
+        if model.reasons.isEmpty { return ["Plenty of memory and CPU to spare"] }
+        guard model.culprit != nil else { return model.reasons }
+        return model.reasons.map {
+            $0.replacingOccurrences(of: #" \(\d+%\)"#, with: "", options: .regularExpression)
+        }
+    }
+
     // MARK: Tiles
 
     @ViewBuilder var tiles: some View {
         let s = model.sample
         let swapWord = model.swapTrend > 0.06 ? "growing"
                      : model.swapTrend < -0.06 ? "shrinking" : "steady"
-        let memColor: Color = s.pressure >= 4 ? .red : s.pressure >= 2 ? .orange : .green
+        let memColor: Color = s.pressure >= 4 ? .red : s.pressure >= 2 ? .orange : .blue
         Tile(label: "Memory", value: String(format: "%.1f GB", s.memUsed),
              detail: model.pressureLabel,
              detailColor: s.pressure >= 4 ? .red : s.pressure >= 2 ? .warnText : .secondary,
              history: model.memHistory, maxY: s.total, color: memColor,
-             parts: [(s.appMem, memColor), (s.wired, .blue), (s.compressed, .purple)], partsTotal: s.total,
+             parts: [(s.appMem, .blue), (s.wired, .teal), (s.compressed, .purple)], partsTotal: s.total,
              partsHelp: String(format: "App %.1f GB · Wired %.1f GB · Compressed %.1f GB · Free and cache %.1f GB",
                                s.appMem, s.wired, s.compressed, max(s.total - s.memUsed, 0)))
             .help(String(format: "%.1f of %.0f GB in use. Pressure: %@", s.memUsed, s.total,
                          model.pressureLabel.lowercased()))
+            .accessibilityLabel(String(format: "Memory, %.1f of %.0f GB in use, %@ pressure", s.memUsed, s.total,
+                                       model.pressureLabel.lowercased()))
 
         // Heat replaces the core count when macOS is throttling the CPU.
         let heat: (String, Color)? = switch s.thermal {
@@ -1489,7 +1507,7 @@ struct ContentView: View {
              detailColor: heat?.1 ?? .secondary,
              history: model.cpuHistory, maxY: 100,
              color: model.cpuNow > 90 ? .red : model.cpuNow > 70 ? .orange : .blue,
-             parts: [(model.cpuSplit.user, .blue), (model.cpuSplit.system, .red)], partsTotal: 100,
+             parts: [(model.cpuSplit.user, .blue), (model.cpuSplit.system, .teal)], partsTotal: 100,
              partsHelp: String(format: "User %.0f%% · System %.0f%% · Idle %.0f%%", model.cpuSplit.user,
                                model.cpuSplit.system, max(100 - model.cpuNow, 0)))
 
@@ -1503,6 +1521,7 @@ struct ContentView: View {
              history: model.swapHistory, maxY: max(1, (model.swapHistory.max() ?? 0) * 1.2),
              color: swapWord == "growing" ? .orange : .gray,
              parts: disk.map { [($0.total - $0.free, diskColor)] } ?? [], partsTotal: disk?.total ?? 1,
+             partsLabel: disk == nil ? nil : "Disk",
              partsHelp: disk.map { String(format: "Startup disk: %.0f GB free of %.0f GB", $0.free, $0.total) } ?? "")
     }
 
@@ -1521,8 +1540,7 @@ struct ContentView: View {
         return Card {
             VStack(spacing: 2) {
                 HStack {
-                    // Only when the Mac actually is slow: a big app on a healthy Mac isn't slowing you down.
-                    Text(model.status.verdict != .smooth && rows.contains { isHot($0) } ? "Slowing you down"
+                    Text(rows.contains { isHot($0) } ? "Using the most \(sort == .cpu ? "CPU" : "memory")"
                          : showAll ? "All apps" : "Top apps")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.secondary)
@@ -1560,11 +1578,26 @@ struct ContentView: View {
                         let parts = open ? min(app.parts.count, Breakdown.maxRows + 1) : 0
                         return h + 26 + 2 + CGFloat(parts) * (24 + 2)
                     }
-                    ScrollView(.vertical, showsIndicators: false) { VStack(spacing: 2) { list } }
-                        .frame(height: min(height, 26 * 14))
+                    // When rows overflow, the bottom edge fades so it's clear there is more,
+                    // and the padding lets the last row scroll clear of the fade.
+                    let cap: CGFloat = 26 * 14
+                    let overflows = height > cap
+                    ScrollView(.vertical) {
+                        VStack(spacing: 2) { list }.padding(.bottom, overflows ? 14 : 0)
+                    }
+                    .frame(height: min(height, cap))
+                    .mask {
+                        VStack(spacing: 0) {
+                            Color.black
+                            if overflows {
+                                LinearGradient(colors: [.black, .black.opacity(0)],
+                                               startPoint: .top, endPoint: .bottom).frame(height: 18)
+                            }
+                        }
+                    }
                 }
 
-                Button(showAll ? "Less" : "More…") { showAll.toggle() }
+                Button(showAll ? "Show top \(appCount)" : "Show all") { showAll.toggle() }
                     .buttonStyle(.hoverSmall)
                     .frame(maxWidth: .infinity, alignment: .trailing)
                     .padding(.top, 4)
@@ -1573,8 +1606,13 @@ struct ContentView: View {
         }
     }
 
+    // Only when the Mac actually is slow, and only for what is slowing it: a big app on a
+    // healthy Mac isn't to blame, and an orange row under a green "Running smoothly" (or a
+    // memory-heavy app while the CPU is the problem) contradicts the verdict.
     func isHot(_ app: AppUsage) -> Bool {
-        !app.isSystem && (sort == .memory ? app.mb >= 2048 : cpuShare(app.cpu) >= 25)
+        guard model.status.verdict != .smooth, !app.isSystem else { return false }
+        return sort == .memory ? model.cause == .memory && app.mb >= 2048
+                               : model.cause == .cpu && cpuShare(app.cpu) >= 25
     }
 
     // MARK: Footer
@@ -1606,6 +1644,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.hoverPlain)
                 .help("Settings")
+                .accessibilityLabel("Settings")
                 Button {
                     confirmQuit = true
                 } label: {
@@ -1613,6 +1652,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(.hoverPlain)
                 .help("Quit Headroom")
+                .accessibilityLabel("Quit Headroom")
             }
         }
         .font(.subheadline)
@@ -1631,6 +1671,7 @@ struct Tile: View {
     let color: Color
     var parts: [(Double, Color)] = []  // what the value is made of, drawn as a thin bar
     var partsTotal: Double = 1
+    var partsLabel: String? = nil  // names the bar when it measures something else (the Swap tile's disk)
     var partsHelp = ""
 
     var body: some View {
@@ -1645,11 +1686,19 @@ struct Tile: View {
                 // frame and popped back to full size while the window resized.
                 .fixedSize(horizontal: false, vertical: true)
             Text(detail).font(.caption2).foregroundStyle(detailColor).lineLimit(1)
-            PartsBar(parts: parts, total: partsTotal)
-                .padding(.top, 5)
-                .help(partsHelp)
+            HStack(spacing: 4) {
+                if let partsLabel {
+                    Text(partsLabel).font(.system(size: 9, weight: .medium)).foregroundStyle(.secondary)
+                }
+                PartsBar(parts: parts, total: partsTotal)
+            }
+            // Same height with or without the label, so the three tiles line up.
+            .frame(height: 11)
+            .padding(.top, 1)
+            .help(partsHelp)
             Sparkline(values: history, maxY: maxY, color: color)
                 .frame(height: 20)
+                .accessibilityHidden(true)
                 .padding(.top, 4)
         }
         .padding(10)
@@ -1659,6 +1708,9 @@ struct Tile: View {
             shape.fill(Color.card)
             shape.strokeBorder(Color.cardEdge, lineWidth: 0.5)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(label), \(value), \(detail)")
+        .accessibilityValue(partsHelp)
     }
 }
 
@@ -1803,12 +1855,28 @@ struct AppRow: View {
         .onTapGesture { if app.hasBreakdown && !confirming { model.toggle(app) } }
         .onDisappear { confirming = false }
         .help(tooltip)
+        // Rows are reachable with Full Keyboard Access (Tab), and Return or Space opens the breakdown.
+        .focusable(!confirming, interactions: .activate)
+        .onKeyPress(keys: [.return, .space]) { _ in
+            guard app.hasBreakdown, !confirming else { return .ignored }
+            model.toggle(app)
+            return .handled
+        }
+        .accessibilityElement(children: confirming ? .contain : .ignore)
+        .accessibilityLabel(confirming ? "Quit \(app.name)?" : "\(app.name), \(tooltip)")
+        .accessibilityAddTraits(app.hasBreakdown ? .isButton : [])
+        .accessibilityValue(app.hasBreakdown ? (open ? "expanded" : "collapsed") : "")
+        .accessibilityAction { if app.hasBreakdown { model.toggle(app) } }
+        .accessibilityActions {
+            if canQuit { Button("Quit \(app.name)") { confirming = true } }
+        }
     }
 
     var tooltip: String {
         var parts = [formatMB(app.mb), String(format: "%.0f%% CPU", cpuShare(app.cpu))]
         if app.count > 1 { parts.append("\(app.count) processes") }
         if app.hasBreakdown { parts.append("click for a breakdown") }
+        if hot { parts.append("high for this Mac right now") }
         return parts.joined(separator: " · ")
     }
 
@@ -1893,6 +1961,8 @@ struct PartRow: View {
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .help(tooltip)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(tooltip)
     }
 
     // The row has room for a folder name, not a path: "~/Code/AI/workflows/src/jev"
@@ -2023,6 +2093,7 @@ struct ProjectRow: View {
                 }
             }
             .help("\(running.count) of \(items.count) running")
+            .accessibilityLabel("\(running.count) of \(items.count) running")
             Spacer(minLength: 6)
             if anyBusy {
                 ProgressView().controlSize(.mini)
@@ -2047,6 +2118,21 @@ struct ProjectRow: View {
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .onTapGesture { model.toggle(key) }
+        .focusable(interactions: .activate)
+        .onKeyPress(keys: [.return, .space]) { _ in model.toggle(key); return .handled }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(name.isEmpty ? "Other" : name), \(running.count) of \(items.count) running"
+                            + (mb > 0 ? ", \(formatMB(mb))" : ""))
+        .accessibilityAddTraits(.isButton)
+        .accessibilityValue(open ? "expanded" : "collapsed")
+        .accessibilityAction { model.toggle(key) }
+        .accessibilityActions {
+            if running.isEmpty {
+                Button("Start") { model.start(items) }
+            } else {
+                Button(running.count == 1 ? "Stop" : "Stop all") { model.stop(running) }
+            }
+        }
     }
 }
 
@@ -2121,6 +2207,17 @@ struct ContainerRow: View {
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .help(tooltip)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(c.name), \(c.restarting ? "crashing" : stopped ? "stopped" : "running")"
+                            + (c.mb.map { ", " + formatMB($0) } ?? "") + ", " + tooltip)
+        .accessibilityActions {
+            Button(stopped ? "Start" : "Stop") { stopped ? model.start([c]) : model.stop([c]) }
+            if let port = c.port, !stopped, !c.isInfra {
+                Button("Open localhost:" + String(port)) {
+                    NSWorkspace.shared.open(URL(string: "http://localhost:" + String(port))!)
+                }
+            }
+        }
     }
 
     // "web · up 9 hr · 7% CPU"
